@@ -29,17 +29,11 @@ def main() -> None:
 
     print(f"Loading {args.assignments} ...", file=sys.stderr)
     adata = ad.read_h5ad(args.assignments)
-    method = str(
-        adata.uns.get("guide_assignment_method", os.path.basename(args.assignments))
-    )
 
     is_unassigned = adata.obs["is_unassigned"].astype(bool).values
     is_multi = adata.obs["is_multi_infected"].astype(bool).values
     n_cells = adata.n_obs
-    print(
-        f"  {method}: {n_cells} cells, {(~is_unassigned).sum()} assigned",
-        file=sys.stderr,
-    )
+    print(f"  {n_cells} cells, {(~is_unassigned).sum()} assigned", file=sys.stderr)
 
     X = adata.X
     X = X.toarray() if sp.issparse(X) else np.asarray(X)
@@ -56,7 +50,6 @@ def main() -> None:
             dataset=dataset,
             metric="coverage",
             submetric="fraction_assigned",
-            method=method,
             value=float((~is_unassigned).mean()),
             n=n_cells,
         ),
@@ -64,7 +57,6 @@ def main() -> None:
             dataset=dataset,
             metric="coverage",
             submetric="frac_multi_infected",
-            method=method,
             value=float(is_multi.mean()),
             n=n_cells,
         ),
@@ -82,7 +74,6 @@ def main() -> None:
                 dataset=dataset,
                 metric="umi",
                 submetric="mean_assigned_umi_frac",
-                method=method,
                 value=float(np.nanmean(frac)),
                 n=int(valid.sum()),
             )
@@ -97,7 +88,6 @@ def main() -> None:
                     dataset=dataset,
                     metric="umi",
                     submetric="top1_match_rate",
-                    method=method,
                     value=float((top1_umi == top1_assigned).mean()),
                     n=int(single.sum()),
                 )
