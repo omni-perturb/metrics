@@ -47,69 +47,54 @@ def _dense(X) -> np.ndarray:
 def rna_knockdown_rows(adata: ad.AnnData, h5mu_path: str, dataset: str) -> list[dict]:
     import muon as mu
 
-    mdata = mu.read_h5mu(h5mu_path)
-    if "rna" not in mdata.mod:
-        print("  no 'rna' modality in h5mu; skipping RNA metrics", file=sys.stderr)
-        return []
+    rna = mu.read_h5mu(h5mu_path)["rna"]
+    X = rna.X
+    lib = np.asarray(X.sum(axis=1)).ravel().astype(np.float64)
+    lib[lib == 0] = 1.0
 
-    rna = mdata["rna"]
-    print(f"  RNA: {rna.n_obs} cells x {rna.n_vars} genes", file=sys.stderr)
-
-    # per-cell library sizes — row sums on the sparse matrix directly
-    X_rna = rna.X
-    lib = np.asarray(X_rna.sum(axis=1)).flatten().astype(np.float64)
-    lib = np.where(lib > 0, lib, 1.0)
-
-    # build gene symbol → column index; prefer var_names, fall back to gene_name column
-    gene_names = np.array(rna.var_names)
-    gene_index: dict[str, int] = {g: i for i, g in enumerate(gene_names)}
+    gene_idx = {g: i for i, g in enumerate(rna.var_names)}
     if "gene_name" in rna.var.columns:
-        for i, sym in enumerate(rna.var["gene_name"]):
-            if sym and sym not in gene_index:
-                gene_index[sym] = i
+        for i, s in enumerate(rna.var["gene_name"]):
+            if s and s not in gene_idx:
+                gene_idx[s] = i
 
-    # singly-assigned cells (barcodes are aligned — no subsetting needed)
-    is_unassigned = adata.obs["is_unassigned"].astype(bool).values
-    is_multi = adata.obs["is_multi_infected"].astype(bool).values
-    single = ~is_unassigned & ~is_multi
-
+    single = (~adata.obs["is_unassigned"].astype(bool).values
+              & ~adata.obs["is_multi_infected"].astype(bool).values)
     tg = adata.obs["target_gene"].fillna("").values
-    nt_mask = single & (tg == "non-targeting")
 
-    targets = (
-        pd.Series(tg[single])
-        .value_counts()
-        .drop(labels=["non-targeting", ""], errors="ignore")
-    )
+    # nt_mask ⊆ single (NT cells are always singly-assigned), so single covers both
+    tg_s = tg[single]
+    lib_s = lib[single]
 
-    # convert to CSC once so column slicing is O(nnz_per_column) not O(nnz_total)
-    X_csc = X_rna.tocsc() if sp.issparse(X_rna) else X_rna
-
-    lfcs: list[float] = []
-    n_missing = 0
-    for target_gene, n_assigned in targets.items():
-        if n_assigned < 5:
-            continue
-        if target_gene not in gene_index:
-            n_missing += 1
-            continue
-        g_idx = gene_index[target_gene]
-        col = X_csc[:, g_idx].toarray().ravel() if sp.issparse(X_csc) else X_csc[:, g_idx]
-        col_norm = np.log1p(col.astype(np.float64) / lib * 1e4)
-        tg_mask = single & (tg == target_gene)
-        lfc = float(col_norm[tg_mask].mean() - col_norm[nt_mask].mean())
-        lfcs.append(lfc)
-
-    if n_missing:
-        print(f"  {n_missing} target genes not found in RNA var", file=sys.stderr)
-    if not lfcs:
+    tgt_counts = (pd.Series(tg_s).value_counts()
+                  .drop(["non-targeting", ""], errors="ignore"))
+    targets = [(t, gene_idx[t]) for t, n in tgt_counts.items()
+               if n >= 5 and t in gene_idx]
+    if not targets:
         return []
+
+    names, col_idxs = zip(*targets)
+    col_idxs = np.array(col_idxs)
+
+    # row-slice to singly-assigned cells, then extract only needed gene columns
+    X_s = X[single][:, col_idxs]
+    if sp.issparse(X_s):
+        X_s = X_s.tocsc().astype(np.float64)
+        X_s = X_s.multiply(1.0 / lib_s[:, None] * 1e4)
+        X_s.data = np.log1p(X_s.data)   # log1p(0)=0: sparse zeros stay zero
+    else:
+        X_s = np.log1p(X_s.astype(np.float64) / lib_s[:, None] * 1e4)
+
+    nt_s = tg_s == "non-targeting"
+    nt_means = np.asarray(X_s[nt_s].mean(axis=0)).ravel()
+
+    lfcs = [
+        float(np.asarray(X_s[:, i][tg_s == name].mean()) - nt_means[i])
+        for i, name in enumerate(names)
+    ]
 
     arr = np.array(lfcs)
-    print(
-        f"  RNA knockdown: {len(arr)} targets, median LFC {np.median(arr):.3f}",
-        file=sys.stderr,
-    )
+    print(f"  RNA: {len(arr)} targets, median LFC {np.median(arr):.3f}", file=sys.stderr)
     return [
         dict(dataset=dataset, metric="rna_knockdown", submetric="n_targets_with_rna",
              value=float(len(arr)), n=len(arr)),
@@ -129,14 +114,9 @@ def main() -> None:
 
     is_unassigned = adata.obs["is_unassigned"].astype(bool).values
     is_multi = adata.obs["is_multi_infected"].astype(bool).values
+    single = ~is_unassigned & ~is_multi
     n_cells = adata.n_obs
     print(f"  {n_cells} cells, {(~is_unassigned).sum()} assigned", file=sys.stderr)
-
-    X = _dense(adata.X).astype(np.float32)
-
-    assigned_mat = None
-    if "assigned" in adata.layers:
-        assigned_mat = _dense(adata.layers["assigned"])
 
     dataset = args.name
     rows = [
@@ -146,7 +126,10 @@ def main() -> None:
              value=float(is_multi.mean()), n=n_cells),
     ]
 
-    if assigned_mat is not None and (~is_unassigned).any():
+    if "assigned" in adata.layers and (~is_unassigned).any():
+        X = _dense(adata.X).astype(np.float32)
+        assigned_mat = _dense(adata.layers["assigned"])
+
         X_a = X[~is_unassigned]
         A_a = assigned_mat[~is_unassigned].astype(np.float32)
         total_umi = X_a.sum(axis=1)
@@ -156,7 +139,6 @@ def main() -> None:
         rows.append(dict(dataset=dataset, metric="umi", submetric="mean_assigned_umi_frac",
                          value=float(np.nanmean(frac)), n=int(valid.sum())))
 
-        single = ~is_unassigned & ~is_multi
         if single.any():
             top1_umi = np.argmax(X[single], axis=1)
             top1_assigned = np.argmax(assigned_mat[single], axis=1)
@@ -165,8 +147,7 @@ def main() -> None:
                              n=int(single.sum())))
 
     if "target_gene" in adata.obs.columns:
-        single_mask = ~is_unassigned & ~is_multi
-        tg = adata.obs.loc[single_mask, "target_gene"]
+        tg = adata.obs.loc[single, "target_gene"]
         cells_per_target = tg[tg != ""].value_counts()
         n_targets = len(cells_per_target)
 
@@ -175,7 +156,7 @@ def main() -> None:
             rows += [
                 dict(dataset=dataset, metric="perturbation_coverage",
                      submetric="n_targets", value=float(n_targets),
-                     n=int(single_mask.sum())),
+                     n=int(single.sum())),
                 dict(dataset=dataset, metric="perturbation_coverage",
                      submetric="median_cells_per_target", value=float(np.median(counts)),
                      n=n_targets),
@@ -187,12 +168,10 @@ def main() -> None:
                      n=n_targets),
             ]
 
-            nt_cells = int(cells_per_target.get("non-targeting", 0))
-            total_single = int(single_mask.sum())
             rows.append(dict(dataset=dataset, metric="perturbation_coverage",
                              submetric="frac_nt_cells",
-                             value=float(nt_cells / total_single) if total_single > 0 else float("nan"),
-                             n=total_single))
+                             value=float(cells_per_target.get("non-targeting", 0) / single.sum()),
+                             n=int(single.sum())))
 
     if args.rawcounts:
         print(f"Loading RNA from {args.rawcounts} ...", file=sys.stderr)
