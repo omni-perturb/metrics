@@ -10,6 +10,16 @@ import pandas as pd
 import scipy.sparse as sp
 
 
+def gini(counts: np.ndarray) -> float:
+    """Gini coefficient of a 1-D array of non-negative counts."""
+    a = np.sort(counts.astype(float))
+    n = len(a)
+    if n == 0 or a.sum() == 0:
+        return float("nan")
+    idx = np.arange(1, n + 1)
+    return float((2 * (idx * a).sum() / (n * a.sum())) - (n + 1) / n)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="guide assignment comparison metrics")
     parser.add_argument(
@@ -90,6 +100,58 @@ def main() -> None:
                     submetric="top1_match_rate",
                     value=float((top1_umi == top1_assigned).mean()),
                     n=int(single.sum()),
+                )
+            )
+
+    if "target_gene" in adata.obs.columns:
+        single_mask = ~is_unassigned & ~is_multi
+        tg = adata.obs.loc[single_mask, "target_gene"]
+        cells_per_target = tg[tg != ""].value_counts()
+        n_targets = len(cells_per_target)
+
+        if n_targets > 0:
+            counts = cells_per_target.values
+            rows += [
+                dict(
+                    dataset=dataset,
+                    metric="perturbation_coverage",
+                    submetric="n_targets",
+                    value=float(n_targets),
+                    n=int(single_mask.sum()),
+                ),
+                dict(
+                    dataset=dataset,
+                    metric="perturbation_coverage",
+                    submetric="median_cells_per_target",
+                    value=float(np.median(counts)),
+                    n=n_targets,
+                ),
+                dict(
+                    dataset=dataset,
+                    metric="perturbation_coverage",
+                    submetric="min_cells_per_target",
+                    value=float(counts.min()),
+                    n=n_targets,
+                ),
+                dict(
+                    dataset=dataset,
+                    metric="perturbation_coverage",
+                    submetric="gini_cells_per_target",
+                    value=gini(counts),
+                    n=n_targets,
+                ),
+            ]
+
+            nt_mask = cells_per_target.index == "non-targeting"
+            nt_cells = int(cells_per_target[nt_mask].sum())
+            total_single = int((~is_unassigned & ~is_multi).sum())
+            rows.append(
+                dict(
+                    dataset=dataset,
+                    metric="perturbation_coverage",
+                    submetric="frac_nt_cells",
+                    value=float(nt_cells / total_single) if total_single > 0 else float("nan"),
+                    n=total_single,
                 )
             )
 
