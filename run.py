@@ -53,30 +53,27 @@ def rna_knockdown_rows(adata: ad.AnnData, h5mu_path: str, dataset: str) -> list[
         return []
 
     rna = mdata["rna"]
-    common = adata.obs_names.intersection(rna.obs_names)
-    adata_c = adata[common]
-    rna_c = rna[common]
-    print(f"  RNA: {rna_c.n_obs} cells x {rna_c.n_vars} genes (aligned)", file=sys.stderr)
+    print(f"  RNA: {rna.n_obs} cells x {rna.n_vars} genes", file=sys.stderr)
 
-    # per-cell library sizes from sparse row sums — never densify the full matrix
-    X_rna = rna_c.X
+    # per-cell library sizes — row sums on the sparse matrix directly
+    X_rna = rna.X
     lib = np.asarray(X_rna.sum(axis=1)).flatten().astype(np.float64)
     lib = np.where(lib > 0, lib, 1.0)
 
     # build gene symbol → column index; prefer var_names, fall back to gene_name column
-    gene_names = np.array(rna_c.var_names)
+    gene_names = np.array(rna.var_names)
     gene_index: dict[str, int] = {g: i for i, g in enumerate(gene_names)}
-    if "gene_name" in rna_c.var.columns:
-        for i, sym in enumerate(rna_c.var["gene_name"]):
+    if "gene_name" in rna.var.columns:
+        for i, sym in enumerate(rna.var["gene_name"]):
             if sym and sym not in gene_index:
                 gene_index[sym] = i
 
-    # singly-assigned cells
-    is_unassigned = adata_c.obs["is_unassigned"].astype(bool).values
-    is_multi = adata_c.obs["is_multi_infected"].astype(bool).values
+    # singly-assigned cells (barcodes are aligned — no subsetting needed)
+    is_unassigned = adata.obs["is_unassigned"].astype(bool).values
+    is_multi = adata.obs["is_multi_infected"].astype(bool).values
     single = ~is_unassigned & ~is_multi
 
-    tg = adata_c.obs["target_gene"].fillna("").values
+    tg = adata.obs["target_gene"].fillna("").values
     nt_mask = single & (tg == "non-targeting")
 
     targets = (
@@ -84,6 +81,9 @@ def rna_knockdown_rows(adata: ad.AnnData, h5mu_path: str, dataset: str) -> list[
         .value_counts()
         .drop(labels=["non-targeting", ""], errors="ignore")
     )
+
+    # convert to CSC once so column slicing is O(nnz_per_column) not O(nnz_total)
+    X_csc = X_rna.tocsc() if sp.issparse(X_rna) else X_rna
 
     lfcs: list[float] = []
     n_missing = 0
@@ -94,9 +94,7 @@ def rna_knockdown_rows(adata: ad.AnnData, h5mu_path: str, dataset: str) -> list[
             n_missing += 1
             continue
         g_idx = gene_index[target_gene]
-        # extract one column, normalise, log1p — stays O(n_cells) per gene
-        col = np.asarray(X_rna[:, g_idx].todense()).flatten() if sp.issparse(X_rna) \
-              else X_rna[:, g_idx]
+        col = X_csc[:, g_idx].toarray().ravel() if sp.issparse(X_csc) else X_csc[:, g_idx]
         col_norm = np.log1p(col.astype(np.float64) / lib * 1e4)
         tg_mask = single & (tg == target_gene)
         lfc = float(col_norm[tg_mask].mean() - col_norm[nt_mask].mean())
