@@ -76,20 +76,18 @@ def rna_knockdown_rows(adata: ad.AnnData, h5mu_path: str, dataset: str) -> list[
     names, col_idxs = zip(*targets)
     col_idxs = np.array(col_idxs)
 
-    # row-slice to singly-assigned cells, then extract only needed gene columns
+    # row-slice to singly-assigned cells, extract needed columns, then densify:
+    # 77k cells × 2000 genes is only ~600 MB and lets all downstream ops be plain numpy
     X_s = X[single][:, col_idxs]
     if sp.issparse(X_s):
-        X_s = X_s.tocsc().astype(np.float64)
-        X_s = X_s.multiply(1.0 / lib_s[:, None] * 1e4)
-        X_s.data = np.log1p(X_s.data)   # log1p(0)=0: sparse zeros stay zero
-    else:
-        X_s = np.log1p(X_s.astype(np.float64) / lib_s[:, None] * 1e4)
+        X_s = X_s.toarray()
+    X_s = np.log1p(X_s.astype(np.float32) / lib_s[:, None].astype(np.float32) * 1e4)
 
     nt_s = tg_s == "non-targeting"
-    nt_means = np.asarray(X_s[nt_s].mean(axis=0)).ravel()
+    nt_means = X_s[nt_s].mean(axis=0)
 
     lfcs = [
-        float(np.asarray(X_s[:, i][tg_s == name].mean()) - nt_means[i])
+        float(X_s[tg_s == name, i].mean() - nt_means[i])
         for i, name in enumerate(names)
     ]
 
